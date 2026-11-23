@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -453,11 +454,53 @@ func (e *poolCooldownTerminalError) Headers() http.Header {
 	for cur := e.cause; cur != nil; cur = errors.Unwrap(cur) {
 		if carrier, ok := cur.(interface{ Headers() http.Header }); ok && carrier != nil {
 			if hdr := carrier.Headers(); len(hdr) > 0 {
-				return hdr
+				return capClaudeUnifiedResetHeaders(hdr, e.deadline)
 			}
 		}
 	}
 	return nil
+}
+
+// capClaudeUnifiedResetHeaders keeps the last attempt's Claude unified
+// rate-limit headers but moves their reset times no later than the pool's
+// earliest recovery. Those headers describe only the credential tried last;
+// clients such as Claude Code show and schedule retries from them, so passing
+// them through unchanged advertises that credential's (possibly much later)
+// reset instead of when the pool can serve again.
+func capClaudeUnifiedResetHeaders(headers http.Header, deadline time.Time) http.Header {
+	if deadline.IsZero() || !hasClaudeUnifiedHeader(headers) {
+		return headers
+	}
+	capped := headers.Clone()
+	limit := deadline.Unix()
+	if deadline.Nanosecond() > 0 {
+		limit++
+	}
+	limitStr := strconv.FormatInt(limit, 10)
+	resetKeys := []string{"Anthropic-Ratelimit-Unified-Reset"}
+	for _, window := range rejectedClaudeUnifiedWindows(capped) {
+		resetKeys = append(resetKeys, claudeUnifiedWindowHeader(window, "Reset"))
+	}
+	for _, key := range resetKeys {
+		raw := strings.TrimSpace(capped.Get(key))
+		if raw == "" {
+			continue
+		}
+		if reset, errParse := strconv.ParseInt(raw, 10, 64); errParse == nil && reset <= limit {
+			continue
+		}
+		capped.Set(key, limitStr)
+	}
+	return capped
+}
+
+func hasClaudeUnifiedHeader(headers http.Header) bool {
+	for key := range headers {
+		if strings.HasPrefix(strings.ToLower(key), "anthropic-ratelimit-unified-") {
+			return true
+		}
+	}
+	return false
 }
 
 // trustedRetryAfterError annotates a terminal upstream rejection whose
