@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/MoeForge/moego/json"
+	"github.com/MoeForge/moego/ojson"
 )
 
 // ErrorCodeRequestScoped identifies failures tied to the current request rather
@@ -393,7 +394,45 @@ func (e *poolCooldownTerminalError) Error() string {
 	if e == nil || e.cause == nil {
 		return ""
 	}
-	return e.cause.Error()
+	return capCodexUsageLimitReset(e.cause.Error(), e.deadline, time.Now())
+}
+
+// capCodexUsageLimitReset moves the reset in a Codex usage_limit_reached body
+// no later than the pool's earliest recovery. The body describes only the
+// credential tried last; Codex prints "Try again at ..." from it, and clients
+// such as T3 Code schedule their resume from that text.
+func capCodexUsageLimitReset(body string, deadline, now time.Time) string {
+	if deadline.IsZero() || !strings.Contains(body, "usage_limit_reached") {
+		return body
+	}
+	trimmed := strings.TrimSpace(body)
+	if !ojson.Valid(trimmed) || !strings.EqualFold(ojson.Get(trimmed, "error.type").String(), "usage_limit_reached") {
+		return body
+	}
+	limit := deadline.Unix()
+	if deadline.Nanosecond() > 0 {
+		limit++
+	}
+	doc := ojson.NewDocString(trimmed)
+	changed := false
+	if resetsAt := doc.Get("error.resets_at"); resetsAt.Exists() && resetsAt.Int() > limit {
+		_ = doc.Set("error.resets_at", limit)
+		changed = true
+	}
+	if resetsIn := doc.Get("error.resets_in_seconds"); resetsIn.Exists() {
+		remaining := limit - now.Unix()
+		if remaining < 0 {
+			remaining = 0
+		}
+		if resetsIn.Int() > remaining {
+			_ = doc.Set("error.resets_in_seconds", remaining)
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	return doc.String()
 }
 
 func (e *poolCooldownTerminalError) Unwrap() error {
