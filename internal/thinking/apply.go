@@ -316,12 +316,19 @@ func applyThinkingDocCore(doc *ojson.Doc, docValid bool, sourceBody []byte, mode
 	}
 
 	// 3. Model capability check
+	if nativeResponses {
+		normalized, errNormalize := normalizeNativeResponsesEffortDoc(doc, docValid, modelInfo, applier, fromFormat, providerFormat, HasThinkingSuffix(model))
+		modified = modified || normalized
+		if errNormalize != nil {
+			return modified, errNormalize
+		}
+	}
 	if !suffixResult.HasSuffix && len(sourceBody) > 0 && isResponsesFormat(fromFormat) && !docValid && hasThinkingConfig(extractConfigurationUpdateConfig(sourceBody)) {
 		// Do not rebuild a malformed target from a separate source update.
 		return modified, nil
 	}
 	if nativeResponses && !suffixResult.HasSuffix {
-		// Native Responses keeps the top-level baseline and in-turn updates as-is.
+		// Native Responses preserves the baseline and update timeline after validation.
 		if log.IsLevelEnabled(log.DebugLevel) && (modelInfo.Thinking != nil || modelInfo.UserDefined) {
 			if config := extractCodexUsageConfigDoc(doc, docValid); hasThinkingConfig(config) {
 				fields := log.Fields{
@@ -471,7 +478,7 @@ func applyThinkingDocCore(doc *ojson.Doc, docValid bool, sourceBody []byte, mode
 	if errApply != nil {
 		return modified, errApply
 	}
-	if thinkingIsFullyDisabled(*validated) || nativeResponses {
+	if thinkingIsFullyDisabled(*validated) || nativeResponses || (!isPluginApplier && thinkingConfigRemovedByApplierDoc(providerFormat, doc, docValid)) {
 		return modified, nil
 	}
 	if providerFormat == "claude" && thinkingRequestedOff(config) {
@@ -509,6 +516,16 @@ func invokeProviderApplierOnDoc(applier ProviderApplier, doc *ojson.Doc, docVali
 
 func thinkingIsFullyDisabled(config ThinkingConfig) bool {
 	return config.Mode == ModeNone && config.Budget == 0 && config.Level == ""
+}
+
+func thinkingConfigRemovedByApplierDoc(providerFormat string, doc *ojson.Doc, docValid bool) bool {
+	if doc == nil || !docValid {
+		return false
+	}
+	if providerFormat == "antigravity" {
+		return !doc.Get("request.generationConfig.thinkingConfig").Exists()
+	}
+	return false
 }
 
 func thinkingRequestedOff(config ThinkingConfig) bool {
@@ -645,7 +662,7 @@ func applyUserDefinedModelDoc(doc *ojson.Doc, docValid bool, modelInfo *registry
 	}
 
 	if !isPluginApplier {
-		config = normalizeUserDefinedConfig(config, fromFormat, toFormat)
+		config = normalizeUserDefinedConfig(config, modelInfo, fromFormat, toFormat)
 	}
 	log.WithFields(log.Fields{
 		"provider": toFormat,
@@ -658,7 +675,7 @@ func applyUserDefinedModelDoc(doc *ojson.Doc, docValid bool, modelInfo *registry
 	if err != nil {
 		return modified, err
 	}
-	if thinkingIsFullyDisabled(config) || nativeResponses {
+	if thinkingIsFullyDisabled(config) || nativeResponses || (!isPluginApplier && thinkingConfigRemovedByApplierDoc(toFormat, doc, docValid)) {
 		return modified, nil
 	}
 	if applySummaryConfigForProviderDoc(doc, docValid, toFormat, modelID, providerKey, modelInfo, summaryConfig) {
@@ -667,7 +684,7 @@ func applyUserDefinedModelDoc(doc *ojson.Doc, docValid bool, modelInfo *registry
 	return modified, nil
 }
 
-func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat string) ThinkingConfig {
+func normalizeUserDefinedConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFormat, toFormat string) ThinkingConfig {
 	if config.Mode != ModeLevel {
 		return config
 	}
@@ -676,6 +693,11 @@ func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat stri
 	}
 	if !isBudgetCapableProvider(toFormat) {
 		return config
+	}
+	if !strings.EqualFold(string(config.Level), string(LevelNone)) && !strings.EqualFold(string(config.Level), string(LevelAuto)) {
+		if isGeminiFamily(fromFormat) || fromFormat == "interactions" || (modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0) {
+			return config
+		}
 	}
 	budget, ok := ConvertLevelToBudget(string(config.Level))
 	if !ok {
@@ -725,6 +747,48 @@ func extractThinkingConfigFromGetter(get func(string) ojson.Result, provider str
 
 func hasThinkingConfig(config ThinkingConfig) bool {
 	return config.Mode != ModeBudget || config.Budget != 0 || config.Level != ""
+}
+
+// RequestedAntigravityThinkingLevel returns the explicit discrete thinking intent before
+// applying model defaults, validation, or clamping. Numeric budgets use the
+// canonical budget conversion. An explicit suffix always takes precedence.
+func RequestedAntigravityThinkingLevel(body []byte, provider, model string) ThinkingLevel {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	var config ThinkingConfig
+	if suffix := ParseSuffix(model); suffix.HasSuffix {
+		config = parseSuffixToConfig(strings.TrimSpace(suffix.RawSuffix), provider, model)
+		if !hasThinkingConfig(config) {
+			// A catalog may advertise a discrete level the static parser does not know yet.
+			config = ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(suffix.RawSuffix)}
+		}
+	} else {
+		switch provider {
+		case "openai":
+			config = extractAntigravityOpenAIThinking(body)
+		case "interactions":
+			config = extractAntigravityInteractionsThinking(body)
+		default:
+			config = extractThinkingConfigForUsage(body, provider)
+			if !hasThinkingConfig(config) && (provider == "gemini" || provider == "antigravity") {
+				config = extractGeminiConfigFromGetter(func(path string) ojson.Result {
+					return ojson.GetBytesNoCopy(body, strings.Replace(path, ".thinkingConfig.", ".thinking_config.", 1))
+				}, provider)
+			}
+		}
+	}
+	switch config.Mode {
+	case ModeLevel:
+		level := ThinkingLevel(strings.ToLower(strings.TrimSpace(string(config.Level))))
+		if level != LevelAuto && level != LevelNone {
+			return level
+		}
+	case ModeBudget:
+		if config.Budget > 0 {
+			level, _ := ConvertBudgetToLevel(config.Budget)
+			return ThinkingLevel(level)
+		}
+	}
+	return ""
 }
 
 // ExtractReasoningEffort returns the source request's thinking setting as a
@@ -897,6 +961,14 @@ func extractGeminiConfigFromGetter(get func(string) ojson.Result, provider strin
 	if !level.Exists() {
 		level = get(prefix + ".thinking_level")
 	}
+	budget := get(prefix + ".thinkingBudget")
+	if !budget.Exists() {
+		budget = get(prefix + ".thinking_budget")
+	}
+	return geminiThinkingConfigFromValues(level, budget)
+}
+
+func geminiThinkingConfigFromValues(level, budget ojson.Result) ThinkingConfig {
 	if level.Exists() {
 		value := level.String()
 		switch value {
@@ -907,11 +979,6 @@ func extractGeminiConfigFromGetter(get func(string) ojson.Result, provider strin
 		default:
 			return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
 		}
-	}
-
-	budget := get(prefix + ".thinkingBudget")
-	if !budget.Exists() {
-		budget = get(prefix + ".thinking_budget")
 	}
 	if budget.Exists() {
 		value := int(budget.Int())
